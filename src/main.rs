@@ -201,9 +201,9 @@ async fn main() {
     while let Some(products_urls) = rx.recv().await {
         if let Ok(product_page_batch) = products_urls {
             for product_page in product_page_batch {
-                let result_clone_clone_clone = Arc::clone(&result_clone);
+                let result_clone_clone = Arc::clone(&result_clone);
                 cpu_pool.spawn(async move {
-                    let mut lock = result_clone_clone_clone.lock().await;
+                    let mut lock = result_clone_clone.lock().await;
                     lock.push(product_page);
                 });
             }

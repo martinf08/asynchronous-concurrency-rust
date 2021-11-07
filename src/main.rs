@@ -1,67 +1,101 @@
+use async_recursion::async_recursion;
+use reqwest::{Client, Request, RequestBuilder};
+use select::document::Document;
+use select::node::Node;
+use select::predicate::*;
+use select::selection::Selection;
 use std::collections::HashMap;
 use std::error::Error;
 use std::time::Duration;
-use reqwest::{Client, RequestBuilder};
-use select::document::Document;
-use select::node::Node;
+use tokio::io::AsyncReadExt;
 use tokio::macros::support::thread_rng_n;
 use tokio::runtime;
 use tokio::sync::mpsc;
 use tokio::time::*;
-use select::predicate::*;
-use select::selection::Selection;
-use tokio::io::AsyncReadExt;
 
-async fn async_function(name: &str) {
-    for i in 0..5 {
-        println!("{} : {}", name, i);
-        sleep_until(Instant::now() + Duration::from_secs(thread_rng_n(5) as u64)).await;
-    }
-}
+const BASE_URI: &str = "https://www.webscraper.io";
 
 #[tokio::main]
 async fn main() {
     let cpu_pool = runtime::Builder::new_multi_thread()
         .enable_time()
+        .enable_io()
         .build()
         .unwrap();
-    // let (tx, mut rx) = mpsc::channel(100);
 
     let client = reqwest::Client::new();
-    let categories = get_categories(client).await;
+    let categories = get_categories(&client).await.unwrap();
 
+    let (tx, mut rx) = mpsc::channel(100);
 
-    // for i in 0..10 {
-    //     let tx_clone = tx.clone();
-    //     cpu_pool.spawn(async move {
-    //         for _ in 0..10 {
-    //             if let Err(_) = tx_clone.send(i).await {
-    //                 println!("Receiver dropped");
-    //                 return;
-    //             }
-    //         }
-    //     });
-    // }
-    //
-    // while let Some(i) = rx.recv().await {
-    //     cpu_pool.spawn(async move { async_function(&format!("task {}", i)).await });
-    // }
+    for (category, uri) in categories {
+        let tx_clone = tx.clone();
+        let client_clone = client.clone();
+
+        cpu_pool.spawn(async move {
+            dbg!(&category);
+            if let Err(_) = tx_clone
+                .send(get_product_batches(client_clone, category, uri, 1).await)
+                .await
+            {
+                println!("Receiver dropped");
+                return;
+            }
+        });
+    }
+    while let Some(products_urls) = rx.recv().await {
+        if let Ok(urls) = products_urls {
+            dbg!(urls);
+        }
+    }
 }
 
-async fn get_categories(client: Client) -> Result<Vec<String>, Box<dyn Error>> {
-    let res = client.get("https://www.webscraper.io/test-sites/e-commerce/static").send().await?.text().await?;
+async fn get_categories(client: &Client) -> Result<HashMap<String, String>, Box<dyn Error>> {
+    let res = client
+        .get(format!("{}/test-sites/e-commerce/static", self::BASE_URI))
+        .send()
+        .await?
+        .text()
+        .await?;
 
-    let node = Document::from(res.as_str())
+    Ok(Document::from(res.as_str())
         .find(Attr("id", "side-menu").descendant(Name("a")))
         .into_selection()
         .iter()
-        // .inspect(|x| { dbg!(&x); })
-        .filter_map()
         .filter(|n| n.attr("href").is_some())
-        .map(|n| (n.text().trim().to_string(), n.attr("href").unwrap().to_string()))
-        .collect::<HashMap<String, String>>();
+        .map(|n| {
+            (
+                n.text().trim().to_string(),
+                n.attr("href").unwrap().to_string(),
+            )
+        })
+        .collect::<HashMap<String, String>>())
+}
 
-    // dbg!(&node);
+#[async_recursion]
+async fn get_product_batches(
+    client: Client,
+    category_name: String,
+    uri: String,
+    page: u32,
+) -> Result<Vec<String>, reqwest::Error> {
+    dbg!(&uri);
+    let res = client
+        .get(format!("{}{}", self::BASE_URI, uri))
+        .send()
+        .await?
+        .text()
+        .await?;
 
-    Ok(Vec::new())
+    let product_urls = Document::from(res.as_str())
+        .find(
+            And(Name("div"), Class("row"))
+                .descendant(Class("thumbnail"))
+                .descendant(Name("a")),
+        )
+        .filter_map(|n| n.attr("href"))
+        .map(|a| a.to_string())
+        .collect::<Vec<String>>();
+
+    Ok(product_urls)
 }

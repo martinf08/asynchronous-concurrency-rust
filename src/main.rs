@@ -4,8 +4,9 @@ use select::document::Document;
 use select::predicate::*;
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 use tokio::runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 const BASE_URI: &str = "https://www.webscraper.io";
 
@@ -183,7 +184,6 @@ async fn main() {
                         return false;
                     }
 
-                    drop(tx_clone);
                     return true;
                 });
 
@@ -195,13 +195,21 @@ async fn main() {
     }
 
     drop(tx);
+    let result = Arc::new(Mutex::new(Vec::new()));
+    let result_clone = Arc::clone(&result);
+
     while let Some(products_urls) = rx.recv().await {
         if let Ok(product_page_batch) = products_urls {
             for product_page in product_page_batch {
-                cpu_pool.spawn(async move { dbg!(product_page) });
+                let result_clone_clone_clone = Arc::clone(&result_clone);
+                cpu_pool.spawn(async move {
+                    let mut lock = result_clone_clone_clone.lock().await;
+                    lock.push(product_page);
+                });
             }
         }
     }
 
+    dbg!(&result.lock().await.len());
     cpu_pool.shutdown_background();
 }

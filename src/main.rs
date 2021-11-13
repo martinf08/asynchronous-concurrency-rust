@@ -3,12 +3,54 @@ use select::document::Document;
 use select::predicate::*;
 use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env::var;
 use std::error::Error;
 use std::sync::Arc;
 use tokio::runtime;
 use tokio::sync::{mpsc, Mutex};
+use structopt::StructOpt;
+use sqlx::sqlite::SqlitePool;
+use tokio::fs::File;
 
 const BASE_URI: &str = "https://www.webscraper.io";
+const DB_NAME: &str = "webscraper.db";
+
+#[derive(StructOpt, Debug)]
+struct Args {
+    #[structopt(default_value = "scrape")]
+    cmd: String,
+}
+
+pub async fn get_database_pool() -> Result<SqlitePool, anyhow::Error> {
+    let path = format!("./{}", DB_NAME);
+    File::create(&path).await?;
+    let db_pool = SqlitePool::connect(&*format!("sqlite://{}", DB_NAME)).await?;
+
+    Ok(db_pool)
+}
+
+async fn init(db_pool: &Arc<SqlitePool>) -> anyhow::Result<()> {
+    let filename = format!("./{}", DB_NAME);
+    match tokio::fs::remove_file(&filename).await {
+       _ => ()
+    };
+
+    tokio::fs::File::create(&filename).await?;
+
+    sqlx::query(
+        r#"
+CREATE TABLE IF NOT EXISTS pages (
+  id INTEGER PRIMARY KEY NOT NULL,
+  product_id TEXT NOT NULL,
+  raw_data TEXT NOT NULL
+);
+        "#
+    ).execute(&**db_pool)
+        .await?;
+
+    db_pool.close().await;
+    Ok(())
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ProductPage {
@@ -132,13 +174,47 @@ async fn is_last_page(res: String, current: i32) -> bool {
     false
 }
 
-#[tokio::main]
-async fn main() {
-    let cpu_pool = runtime::Builder::new_multi_thread()
-        .enable_time()
-        .enable_io()
-        .build()
-        .unwrap();
+async fn insert_page(db_pool: &Arc<SqlitePool>, page_ref_clone: Arc<Mutex<ProductPage>>) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let res = client
+        .get(format!(
+            "{}{}",
+            self::BASE_URI,
+            &page_ref_clone.lock().await.url
+        ))
+        .send()
+        .await?
+        .text()
+        .await?;
+
+    let boxed_res = Box::new(res);
+    page_ref_clone.lock().await.body = boxed_res;
+    let name = page_ref_clone
+        .lock()
+        .await
+        .url
+        .split("/")
+        .last()
+        .ok_or(anyhow::anyhow!("url is empty"))?
+        .to_string();
+
+    dbg!("ok");
+    sqlx::query("INSERT INTO pages (product_id, body) VALUES (?1, ?2)")
+        .bind(&page_ref_clone.lock().await.url)
+        .bind(&page_ref_clone.lock().await.category)
+        .execute(&**db_pool)
+        .await?;
+
+    let path = format!("./data/{}.json", name);
+    let value = serde_json::to_string_pretty(&*page_ref_clone.lock().await)?;
+
+    println!("{}", &path);
+    tokio::fs::write(path, value).await?;
+
+    Ok(())
+}
+
+async fn scrape(cpu_pool: &runtime::Runtime, db_pool: &Arc<SqlitePool>) -> anyhow::Result<()> {
 
     let client = Arc::new(reqwest::Client::new());
     let categories = get_categories(&client).await.unwrap();
@@ -175,7 +251,7 @@ async fn main() {
                         uri_clone,
                         i,
                     )
-                    .await;
+                        .await;
 
                     if let Err(_) = tx_clone.send(batches).await {
                         println!("Receiver dropped");
@@ -198,13 +274,16 @@ async fn main() {
         .await
         .expect("Failed to create data dir");
 
-    let result = Arc::new(Mutex::new(Vec::new()));
+    // let result = Arc::new(Mutex::new(Vec::new()));
+
     while let Some(products_urls) = rx.recv().await {
+        let db_pool_clone = db_pool.clone();
         if let Ok(product_page_batch) = products_urls {
             for product_page in product_page_batch {
+                let db_pool_clone_clone = db_pool_clone.clone();
                 let page_ref = Arc::new(Mutex::new(product_page));
 
-                let handle = cpu_pool.spawn(async move { download_page(page_ref.clone()).await });
+                let handle = cpu_pool.spawn(async move { insert_page(&db_pool_clone_clone, page_ref.clone()).await });
 
                 result.lock().await.push(handle);
             }
@@ -212,41 +291,34 @@ async fn main() {
     }
 
     for task in result.lock().await.drain(..) {
-        task.await.unwrap();
+        task.await??;
+    }
+
+
+    Ok(())
+}
+
+
+#[paw::main]
+#[tokio::main]
+async fn main(args: Args) -> anyhow::Result<()> {
+    let cpu_pool = runtime::Builder::new_multi_thread()
+        .enable_time()
+        .enable_io()
+        .build()?;
+
+    let db_pool = Arc::new(get_database_pool().await?);
+
+    match args.cmd {
+        x if x == "init" => init(&db_pool).await?,
+        x if x == "scrape" => scrape(&cpu_pool, &db_pool).await?,
+        _ => {
+            println!("{}", "Invalid command");
+            return Ok(());
+        }
     }
 
     cpu_pool.shutdown_background();
-}
 
-async fn download_page(page_ref_clone: Arc<Mutex<ProductPage>>) {
-    let client = reqwest::Client::new();
-    let res = client
-        .get(format!(
-            "{}{}",
-            self::BASE_URI,
-            &page_ref_clone.lock().await.url
-        ))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-
-    let boxed_res = Box::new(res);
-    page_ref_clone.lock().await.body = boxed_res;
-    let name = page_ref_clone
-        .lock()
-        .await
-        .url
-        .split("/")
-        .last()
-        .unwrap()
-        .to_string();
-
-    let path = format!("./data/{}.json", name);
-    let value = serde_json::to_string_pretty(&*page_ref_clone.lock().await).unwrap();
-
-    println!("{}", &path);
-    tokio::fs::write(path, value).await.unwrap();
+    Ok(())
 }

@@ -84,7 +84,7 @@ async fn get_categories(
 }
 
 async fn get_product_batches(
-    client: Client,
+    client: Arc<Client>,
     category: String,
     sub_category: String,
     uri: String,
@@ -140,7 +140,7 @@ async fn main() {
         .build()
         .unwrap();
 
-    let client = reqwest::Client::new();
+    let client = Arc::new(reqwest::Client::new());
     let categories = get_categories(&client).await.unwrap();
 
     let (tx, mut rx) = mpsc::channel(100);
@@ -199,17 +199,14 @@ async fn main() {
         .expect("Failed to create data dir");
 
     let result = Arc::new(Mutex::new(Vec::new()));
-    let result_clone = Arc::clone(&result);
     while let Some(products_urls) = rx.recv().await {
         if let Ok(product_page_batch) = products_urls {
             for product_page in product_page_batch {
                 let page_ref = Arc::new(Mutex::new(product_page));
-                let page_ref_clone = Arc::clone(&page_ref);
 
-                let handle = cpu_pool.spawn(async move { download_page(page_ref_clone).await });
+                let handle = cpu_pool.spawn(async move { download_page(page_ref.clone()).await });
 
-                let mut lock = result_clone.lock().await;
-                lock.push(handle);
+                result.lock().await.push(handle);
             }
         }
     }

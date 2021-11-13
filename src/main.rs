@@ -1,7 +1,7 @@
-use async_recursion::async_recursion;
 use reqwest::Client;
 use select::document::Document;
 use select::predicate::*;
+use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
@@ -10,11 +10,12 @@ use tokio::sync::{mpsc, Mutex};
 
 const BASE_URI: &str = "https://www.webscraper.io";
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ProductPage {
     category: String,
     sub_category: String,
     url: String,
+    body: Box<String>,
 }
 
 async fn get_categories(
@@ -82,7 +83,6 @@ async fn get_categories(
     return Ok(result);
 }
 
-#[async_recursion]
 async fn get_product_batches(
     client: Client,
     category: String,
@@ -111,6 +111,7 @@ async fn get_product_batches(
                 category: category.clone(),
                 sub_category: sub_category.clone(),
                 url,
+                body: Box::from("".to_string()),
             })
         });
 
@@ -167,19 +168,16 @@ async fn main() {
                         return false;
                     }
 
-                    if let Err(_) = tx_clone
-                        .send(
-                            get_product_batches(
-                                client_clone,
-                                category_clone,
-                                sub_category_clone,
-                                uri_clone,
-                                i,
-                            )
-                            .await,
-                        )
-                        .await
-                    {
+                    let batches = get_product_batches(
+                        client_clone,
+                        category_clone,
+                        sub_category_clone,
+                        uri_clone,
+                        i,
+                    )
+                    .await;
+
+                    if let Err(_) = tx_clone.send(batches).await {
                         println!("Receiver dropped");
                         return false;
                     }
@@ -195,21 +193,63 @@ async fn main() {
     }
 
     drop(tx);
+
+    tokio::fs::create_dir_all("./data")
+        .await
+        .expect("Failed to create data dir");
+
     let result = Arc::new(Mutex::new(Vec::new()));
     let result_clone = Arc::clone(&result);
-
     while let Some(products_urls) = rx.recv().await {
         if let Ok(product_page_batch) = products_urls {
             for product_page in product_page_batch {
-                let result_clone_clone = Arc::clone(&result_clone);
-                cpu_pool.spawn(async move {
-                    let mut lock = result_clone_clone.lock().await;
-                    lock.push(product_page);
-                });
+                let page_ref = Arc::new(Mutex::new(product_page));
+                let page_ref_clone = Arc::clone(&page_ref);
+
+                let handle = cpu_pool.spawn(async move { download_page(page_ref_clone).await });
+
+                let mut lock = result_clone.lock().await;
+                lock.push(handle);
             }
         }
     }
 
-    dbg!(&result.lock().await.len());
+    for task in result.lock().await.drain(..) {
+        task.await.unwrap();
+    }
+
     cpu_pool.shutdown_background();
+}
+
+async fn download_page(page_ref_clone: Arc<Mutex<ProductPage>>) {
+    let client = reqwest::Client::new();
+    let res = client
+        .get(format!(
+            "{}{}",
+            self::BASE_URI,
+            &page_ref_clone.lock().await.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    let boxed_res = Box::new(res);
+    page_ref_clone.lock().await.body = boxed_res;
+    let name = page_ref_clone
+        .lock()
+        .await
+        .url
+        .split("/")
+        .last()
+        .unwrap()
+        .to_string();
+
+    let path = format!("./data/{}.json", name);
+    let value = serde_json::to_string_pretty(&*page_ref_clone.lock().await).unwrap();
+
+    println!("{}", &path);
+    tokio::fs::write(path, value).await.unwrap();
 }

@@ -1,16 +1,17 @@
+use futures::*;
 use reqwest::Client;
 use select::document::Document;
 use select::predicate::*;
 use serde_derive::{Deserialize, Serialize};
+use sqlx::sqlite::SqlitePool;
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
+use structopt::StructOpt;
+use tokio::fs::File;
 use tokio::runtime;
 use tokio::sync::{mpsc, Mutex};
-use structopt::StructOpt;
-use sqlx::sqlite::SqlitePool;
-use tokio::fs::File;
-use futures::*;
+use tokio::task::JoinHandle;
 
 const BASE_URI: &str = "https://www.webscraper.io";
 const DB_NAME: &str = "webscraper.db";
@@ -30,10 +31,10 @@ pub async fn get_database_pool() -> Result<SqlitePool, anyhow::Error> {
 async fn init() -> anyhow::Result<()> {
     let filename = format!("./{}", DB_NAME);
     match tokio::fs::remove_file(&filename).await {
-       _ => ()
+        _ => (),
     };
 
-   File::create(&filename).await?;
+    File::create(&filename).await?;
 
     let db_pool = get_database_pool().await?;
 
@@ -41,11 +42,14 @@ async fn init() -> anyhow::Result<()> {
         r#"
 CREATE TABLE IF NOT EXISTS pages (
   id INTEGER PRIMARY KEY NOT NULL,
-  product_id TEXT NOT NULL,
+  url TEXT NOT NULL,
+  html TEXT NOT NULL,
+  parsed INTEGER NOT NULL,
   raw_data TEXT NOT NULL
 );
-        "#
-    ).execute(&db_pool)
+        "#,
+    )
+        .execute(&db_pool)
         .await?;
 
     db_pool.close().await;
@@ -57,7 +61,7 @@ struct ProductPage {
     category: String,
     sub_category: String,
     url: String,
-    body: Box<String>,
+    html: Box<String>,
 }
 
 async fn get_categories(
@@ -152,8 +156,8 @@ async fn get_product_batches(
             product_pages.push(ProductPage {
                 category: category.clone(),
                 sub_category: sub_category.clone(),
-                url,
-                body: Box::from("".to_string()),
+                url: format!("{}{}", self::BASE_URI, url),
+                html: Box::from("".to_string()),
             })
         });
 
@@ -174,43 +178,7 @@ async fn is_last_page(res: String, current: i32) -> bool {
     false
 }
 
-async fn insert_page(db_pool: &Arc<SqlitePool>, page_ref_clone: Arc<Mutex<ProductPage>>) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    let res = client
-        .get(format!(
-            "{}{}",
-            self::BASE_URI,
-            &page_ref_clone.lock().await.url
-        ))
-        .send()
-        .await?
-        .text()
-        .await?;
-
-    let boxed_res = Box::new(res);
-    page_ref_clone.lock().await.body = boxed_res;
-    let name = page_ref_clone
-        .lock()
-        .await
-        .url
-        .split("/")
-        .last()
-        .ok_or(anyhow::anyhow!("url is empty"))?
-        .to_string();
-
-    dbg!("ok");
-
-    let path = format!("./data/{}.json", name);
-    let value = serde_json::to_string_pretty(&*page_ref_clone.lock().await)?;
-
-    println!("{}", &path);
-    tokio::fs::write(path, value).await?;
-
-    Ok(())
-}
-
-async fn get_product_pages() -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>> {
-
+async fn get_product_page_list() -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>> {
     let cpu_pool = runtime::Builder::new_multi_thread()
         .enable_time()
         .enable_io()
@@ -289,29 +257,79 @@ async fn get_product_pages() -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>> {
     Ok(result)
 }
 
-async fn insert_product_pages(product_pages: Arc<Mutex<Vec<ProductPage>>>) -> anyhow::Result<()> {
-    let pages  = &*product_pages.lock().await.clone();
+async fn add_product_pages(product_page_list: Arc<Mutex<Vec<ProductPage>>>) -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>> {
+    let cpu_pool = runtime::Builder::new_multi_thread()
+        .enable_time()
+        .enable_io()
+        .build()?;
 
-    let mut stream = stream::iter(pages.to_vec().into_iter());
+    let mut handlers = Vec::new();
+
+    for product_page in product_page_list.lock().await.iter() {
+        let mutex_page = Arc::new(Mutex::new(product_page.clone()));
+
+        let handler: JoinHandle<(String, Box<String>)> = cpu_pool.spawn({
+            let mutex_page_clone = Arc::clone(&mutex_page);
+
+            async move {
+                let lock = mutex_page_clone.lock().await;
+                let client = reqwest::Client::new();
+                let res = client
+                    .get(&lock.url)
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+
+                (String::from(&lock.url), Box::from(res))
+            }
+        });
+
+        handlers.push(handler);
+    }
+
+    for handler in handlers {
+        let (url, html) = handler.await?;
+        for product_page in product_page_list.lock().await.iter_mut() {
+            if product_page.url == url {
+                product_page.html = html.clone();
+            }
+        }
+    }
+
+    cpu_pool.shutdown_background();
+
+    Ok(product_page_list)
+}
+
+async fn insert_product_pages(product_pages: Arc<Mutex<Vec<ProductPage>>>) -> anyhow::Result<()> {
+    let pages = &*product_pages.lock().await.clone();
+
+    let stream = stream::iter(pages.to_vec().into_iter());
     let db_pool = Arc::new(get_database_pool().await?);
 
-    Ok(stream.for_each_concurrent(None, |page| {
-        let db_pool_clone = Arc::clone(&db_pool);
-        async move {
-            sqlx::query("INSERT INTO pages (product_id, raw_data) VALUES (?1, ?2)")
-                .bind(&page.url)
-                .bind(&page.category)
-                .execute(&*db_pool_clone)
-                .await
-                .unwrap();
-        }
-    }).await)
+    Ok(stream
+        .for_each_concurrent(None, |page| {
+            let db_pool_clone = Arc::clone(&db_pool);
+            async move {
+                sqlx::query("INSERT INTO pages (url, html, parsed, raw_data) VALUES (?1, ?2, ?3, ?4)")
+                    .bind(&page.url)
+                    .bind(&*page.html)
+                    .bind(0)
+                    .bind("".to_string())
+                    .execute(&*db_pool_clone)
+                    .await
+                    .unwrap();
+            }
+        })
+        .await)
 }
 
 #[paw::main]
 #[tokio::main]
 async fn main(args: Args) -> anyhow::Result<()> {
-
     match args.cmd {
         x if x == "init" => init().await?,
         x if x == "scrape" => scrape().await?,
@@ -321,14 +339,13 @@ async fn main(args: Args) -> anyhow::Result<()> {
         }
     }
 
-
     Ok(())
 }
 
 async fn scrape() -> anyhow::Result<()> {
-    let product_pages = get_product_pages().await?;
-    // let parsed_product_pages = parse_product_pages(&product_pages).await.unwrap();
-    insert_product_pages(product_pages).await.unwrap();
+    let product_page_list = get_product_page_list().await?;
+    let product_pages = add_product_pages(product_page_list).await?;
+    insert_product_pages(product_pages).await?;
 
     Ok(())
 }

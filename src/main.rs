@@ -3,18 +3,20 @@ use reqwest::Client;
 use select::document::Document;
 use select::predicate::*;
 use serde_derive::{Deserialize, Serialize};
-use sqlx::sqlite::SqlitePool;
+use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use structopt::StructOpt;
 use tokio::fs::File;
 use tokio::runtime;
-use tokio::sync::{mpsc, Mutex};
-use tokio::task::JoinHandle;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle as OtherJoinHandle;
 
 const BASE_URI: &str = "https://www.webscraper.io";
 const DB_NAME: &str = "webscraper.db";
+const WORKERS: usize = 2;
 
 #[derive(StructOpt, Debug)]
 struct Args {
@@ -23,7 +25,10 @@ struct Args {
 }
 
 pub async fn get_database_pool() -> Result<SqlitePool, anyhow::Error> {
-    let db_pool = SqlitePool::connect(&*format!("sqlite://{}", DB_NAME)).await?;
+    let db_pool = SqlitePoolOptions::new()
+        .max_connections(WORKERS as u32)
+        .connect(&*format!("sqlite://{}", DB_NAME))
+        .await?;
 
     Ok(db_pool)
 }
@@ -49,8 +54,8 @@ CREATE TABLE IF NOT EXISTS pages (
 );
         "#,
     )
-        .execute(&db_pool)
-        .await?;
+    .execute(&db_pool)
+    .await?;
 
     db_pool.close().await;
     Ok(())
@@ -130,7 +135,7 @@ async fn get_categories(
 }
 
 async fn get_product_batches(
-    client: Arc<Client>,
+    client: Client,
     category: String,
     sub_category: String,
     uri: String,
@@ -161,6 +166,7 @@ async fn get_product_batches(
             })
         });
 
+    dbg!(&product_pages.len());
     Ok(product_pages)
 }
 
@@ -180,6 +186,7 @@ async fn is_last_page(res: String, current: i32) -> bool {
 
 async fn get_product_page_list() -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>> {
     let cpu_pool = runtime::Builder::new_multi_thread()
+        .worker_threads(WORKERS)
         .enable_time()
         .enable_io()
         .build()?;
@@ -187,67 +194,64 @@ async fn get_product_page_list() -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>>
     let client = Arc::new(reqwest::Client::new());
     let categories = get_categories(&client).await.unwrap();
 
-    let (tx, mut rx) = mpsc::channel(100);
-
+    let handlers = Arc::new(Mutex::new(Vec::new()));
+    let finish = Arc::new(Mutex::new(false));
+    let i = 0;
     for (category, uris) in categories {
+        let finish_clone = Arc::clone(&finish);
         for (sub_category, uri) in uris {
-            'inner: for i in 0.. {
-                let tx_clone = tx.clone();
-                let client_clone = client.clone();
-                let category_clone = category.clone();
-                let sub_category_clone = sub_category.clone();
-                let uri_clone = uri.clone();
+            *finish_clone.lock().await = false;
+            let category_clone = category.clone();
+            let sub_category_clone = sub_category.clone();
+            let uri_clone = uri.clone();
+            let finish_clone_clone = Arc::clone(&finish_clone);
 
-                let finish = cpu_pool.spawn(async move {
-                    let res = client_clone
-                        .get(format!("{}{}", self::BASE_URI, uri_clone.clone()))
-                        .send()
-                        .await
-                        .unwrap()
-                        .text()
-                        .await
-                        .unwrap();
+            let handler = cpu_pool.spawn(async move {
+                let client = Client::new();
+                let res = client
+                    .get(format!("{}{}", self::BASE_URI, uri_clone.clone()))
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
 
-                    if is_last_page(res, i).await {
-                        return false;
-                    }
-
-                    let batches = get_product_batches(
-                        client_clone,
-                        category_clone,
-                        sub_category_clone,
-                        uri_clone,
-                        i,
-                    )
-                        .await;
-
-                    if let Err(_) = tx_clone.send(batches).await {
-                        println!("Receiver dropped");
-                        return false;
-                    }
-
-                    return true;
-                });
-
-                if !finish.await.unwrap() {
-                    break 'inner;
+                if is_last_page(res, i).await {
+                    *finish_clone_clone.lock().await = true;
+                    return None;
                 }
-            }
+
+                if let Ok(batches) = get_product_batches(
+                    client.clone(),
+                    category_clone,
+                    sub_category_clone,
+                    uri_clone,
+                    i,
+                )
+                .await
+                {
+                    return Some(batches);
+                }
+
+                None
+            });
+
+            handlers.lock().await.push(handler);
         }
     }
 
-    drop(tx);
-
     let result = Arc::new(Mutex::new(Vec::new()));
-    let result_clone = Arc::clone(&result);
 
-    while let Some(products_urls) = rx.recv().await {
-        if let Ok(product_page_batch) = products_urls {
-            for product_page in product_page_batch {
-                let result_clone_clone = Arc::clone(&result_clone);
+    for product_pages in handlers.lock().await.drain(..) {
+        let result_clone = Arc::clone(&result);
+        if let Some(mut page_result) = product_pages.await? {
+            let result_clone_clone = Arc::clone(&result_clone);
+            for page in page_result.drain(..) {
+                let result_clone_clone_clone = Arc::clone(&result_clone_clone);
                 cpu_pool.spawn(async move {
-                    let mut lock = result_clone_clone.lock().await;
-                    lock.push(product_page);
+                    let mut lock = result_clone_clone_clone.lock().await;
+                    lock.push(page);
                 });
             }
         }
@@ -257,8 +261,11 @@ async fn get_product_page_list() -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>>
     Ok(result)
 }
 
-async fn add_product_pages(product_page_list: Arc<Mutex<Vec<ProductPage>>>) -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>> {
+async fn add_product_pages(
+    product_page_list: Arc<Mutex<Vec<ProductPage>>>,
+) -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>> {
     let cpu_pool = runtime::Builder::new_multi_thread()
+        .worker_threads(WORKERS)
         .enable_time()
         .enable_io()
         .build()?;
@@ -268,7 +275,7 @@ async fn add_product_pages(product_page_list: Arc<Mutex<Vec<ProductPage>>>) -> a
     for product_page in product_page_list.lock().await.iter() {
         let mutex_page = Arc::new(Mutex::new(product_page.clone()));
 
-        let handler: JoinHandle<(String, Box<String>)> = cpu_pool.spawn({
+        let handler: OtherJoinHandle<(String, Box<String>)> = cpu_pool.spawn({
             let mutex_page_clone = Arc::clone(&mutex_page);
 
             async move {
@@ -314,14 +321,16 @@ async fn insert_product_pages(product_pages: Arc<Mutex<Vec<ProductPage>>>) -> an
         .for_each_concurrent(None, |page| {
             let db_pool_clone = Arc::clone(&db_pool);
             async move {
-                sqlx::query("INSERT INTO pages (url, html, parsed, raw_data) VALUES (?1, ?2, ?3, ?4)")
-                    .bind(&page.url)
-                    .bind(&*page.html)
-                    .bind(0)
-                    .bind("".to_string())
-                    .execute(&*db_pool_clone)
-                    .await
-                    .unwrap();
+                sqlx::query(
+                    "INSERT INTO pages (url, html, parsed, raw_data) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .bind(&page.url)
+                .bind(&*page.html)
+                .bind(0)
+                .bind("".to_string())
+                .execute(&*db_pool_clone)
+                .await
+                .unwrap();
             }
         })
         .await)

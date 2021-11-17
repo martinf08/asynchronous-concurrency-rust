@@ -6,13 +6,13 @@ use serde_derive::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::collections::HashMap;
 use std::error::Error;
+use std::process::exit;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use structopt::StructOpt;
 use tokio::fs::File;
 use tokio::runtime;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle as OtherJoinHandle;
+use tokio::task::JoinHandle;
 
 const BASE_URI: &str = "https://www.webscraper.io";
 const DB_NAME: &str = "webscraper.db";
@@ -185,7 +185,25 @@ async fn is_last_page(res: String, current: i32) -> bool {
 }
 
 async fn get_product_page_list() -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>> {
-    let cpu_pool = runtime::Builder::new_multi_thread()
+    let client = Arc::new(reqwest::Client::new());
+    let categories = get_categories(&client).await.unwrap();
+
+    stream::iter(categories.into_iter())
+        .for_each(|(categories, uris)| async move {
+            stream::iter(uris.into_iter())
+                .for_each(|(sub_category, uri)| async move {
+                    dbg!(&sub_category);
+                })
+                .await;
+        })
+        .await;
+
+    // stream::iter((0..).into_iter().map(|_| tokio::spawn(todo!())))
+    //     .for_each_concurrent(WORKERS, |f| async move { f.await })
+    //     .await;
+
+    todo!()
+    /* let cpu_pool = runtime::Builder::new_multi_thread()
         .worker_threads(WORKERS)
         .enable_time()
         .enable_io()
@@ -258,7 +276,7 @@ async fn get_product_page_list() -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>>
     }
 
     cpu_pool.shutdown_background();
-    Ok(result)
+    Ok(result)*/
 }
 
 async fn add_product_pages(
@@ -275,7 +293,7 @@ async fn add_product_pages(
     for product_page in product_page_list.lock().await.iter() {
         let mutex_page = Arc::new(Mutex::new(product_page.clone()));
 
-        let handler: OtherJoinHandle<(String, Box<String>)> = cpu_pool.spawn({
+        let handler: JoinHandle<(String, Box<String>)> = cpu_pool.spawn({
             let mutex_page_clone = Arc::clone(&mutex_page);
 
             async move {
@@ -318,7 +336,7 @@ async fn insert_product_pages(product_pages: Arc<Mutex<Vec<ProductPage>>>) -> an
     let db_pool = Arc::new(get_database_pool().await?);
 
     Ok(stream
-        .for_each_concurrent(None, |page| {
+        .for_each_concurrent(WORKERS, |page| {
             let db_pool_clone = Arc::clone(&db_pool);
             async move {
                 sqlx::query(

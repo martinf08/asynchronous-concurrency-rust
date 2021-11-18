@@ -4,15 +4,16 @@ use select::document::Document;
 use select::predicate::*;
 use serde_derive::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
 use std::process::exit;
+use std::rc::Rc;
 use std::sync::Arc;
 use structopt::StructOpt;
 use tokio::fs::File;
 use tokio::runtime;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 
 const BASE_URI: &str = "https://www.webscraper.io";
 const DB_NAME: &str = "webscraper.db";
@@ -65,8 +66,73 @@ CREATE TABLE IF NOT EXISTS pages (
 struct ProductPage {
     category: String,
     sub_category: String,
-    url: String,
-    html: Box<String>,
+    uri: String,
+    product_urls: Vec<String>,
+    last_page: Option<u16>,
+    index: u16,
+}
+
+impl ProductPage {
+    fn new(category: Rc<String>, sub_category: String, uri: String) -> Self {
+        Self {
+            category: category.to_string(),
+            sub_category,
+            uri,
+            product_urls: Vec::new(),
+            last_page: None,
+            index: 1,
+        }
+    }
+
+    fn get_index_url(&self) -> String {
+        format!("{}{}?page={}", self::BASE_URI, self.uri, self.index)
+    }
+
+    fn get_last_page(&self, res: &String) -> Option<u16> {
+        if let Some(node) = Document::from(res.as_str())
+            .find(And(Name("ul"), Class("pagination")).descendant(Name("a")))
+            .filter(|n| n.text().parse::<i32>().is_ok())
+            .last()
+        {
+            if let Ok(page) = node.text().parse::<i32>() {
+                return Some(page as u16);
+            }
+        }
+
+        None
+    }
+
+    fn get_product_urls(&self, res: &String) -> Vec<String> {
+        Document::from(res.as_str())
+            .find(
+                And(Name("div"), Class("row"))
+                    .descendant(Class("thumbnail"))
+                    .descendant(Name("a")),
+            )
+            .filter_map(|n| n.attr("href"))
+            .map(|a| a.to_string())
+            .collect::<Vec<String>>()
+    }
+
+    async fn parse_current_page(&mut self) -> anyhow::Result<bool> {
+        if self.index > self.last_page.unwrap_or(1) {
+            return Ok(false);
+        }
+
+        let client = Client::new();
+        let res = client
+            .get(&self.get_index_url())
+            .send()
+            .await?
+            .text()
+            .await?;
+
+        self.last_page = self.get_last_page(&res);
+        self.product_urls.extend(self.get_product_urls(&res));
+        self.index += 1;
+
+        Ok(true)
+    }
 }
 
 async fn get_categories(
@@ -134,224 +200,81 @@ async fn get_categories(
     return Ok(result);
 }
 
-async fn get_product_batches(
-    client: Client,
-    category: String,
-    sub_category: String,
-    uri: String,
-    i: i32,
-) -> Result<Vec<ProductPage>, reqwest::Error> {
-    let res = client
-        .get(format!("{}{}?page={}", self::BASE_URI, uri, i))
-        .send()
-        .await?
-        .text()
-        .await?;
-
-    let mut product_pages = Vec::new();
-    Document::from(res.as_str())
-        .find(
-            And(Name("div"), Class("row"))
-                .descendant(Class("thumbnail"))
-                .descendant(Name("a")),
-        )
-        .filter_map(|n| n.attr("href"))
-        .map(|a| a.to_string())
-        .for_each(|url| {
-            product_pages.push(ProductPage {
-                category: category.clone(),
-                sub_category: sub_category.clone(),
-                url: format!("{}{}", self::BASE_URI, url),
-                html: Box::from("".to_string()),
-            })
-        });
-
-    dbg!(&product_pages.len());
-    Ok(product_pages)
-}
-
-async fn is_last_page(res: String, current: i32) -> bool {
-    if let Some(node) = Document::from(res.as_str())
-        .find(And(Name("ul"), Class("pagination")).descendant(Name("a")))
-        .filter(|n| n.text().parse::<i32>().is_ok())
-        .last()
-    {
-        if let Ok(page) = node.text().parse::<i32>() {
-            return current > page;
-        }
-    }
-
-    false
-}
-
 async fn get_product_page_list() -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>> {
     let client = Arc::new(reqwest::Client::new());
     let categories = get_categories(&client).await.unwrap();
 
+    let pages = Rc::new(RefCell::new(Vec::new()));
     stream::iter(categories.into_iter())
-        .for_each(|(categories, uris)| async move {
-            stream::iter(uris.into_iter())
-                .for_each(|(sub_category, uri)| async move {
-                    dbg!(&sub_category);
-                })
-                .await;
+        .for_each(|(category, uris)| {
+            let ref_page = Rc::clone(&pages);
+
+            async move {
+                let ref_page_clone = Rc::clone(&ref_page);
+                let ref_category = Rc::new(category);
+
+                stream::iter(uris.into_iter())
+                    .for_each(|(sub_category, uri)| {
+                        let ref_page_clone_clone = Rc::clone(&ref_page_clone);
+                        let ref_category_clone = ref_category.clone();
+
+                        async move {
+                            let mut product_page = ProductPage::new(
+                                ref_category_clone,
+                                sub_category.clone(),
+                                uri.clone(),
+                            );
+
+                            product_page
+                                .parse_current_page()
+                                .await
+                                .expect("Failed to parse product page");
+
+                            ref_page_clone_clone.borrow_mut().push(product_page);
+                        }
+                    })
+                    .await;
+            }
         })
         .await;
 
-    // stream::iter((0..).into_iter().map(|_| tokio::spawn(todo!())))
-    //     .for_each_concurrent(WORKERS, |f| async move { f.await })
-    //     .await;
+    // pages.take().iter_mut().for_each(|page| {
+    //     let count = (page.last_page.unwrap_or(1) - page.index) + 1;
+    //     stream::iter((0..=count).into_iter().map(|_| tokio::spawn(
+    //
+    //         future::ready(())
+    //     )))
+    //         .for_each_concurrent(WORKERS, |f| async move { f.await })
+    //         .await;
+    // });
 
-    todo!()
-    /* let cpu_pool = runtime::Builder::new_multi_thread()
-        .worker_threads(WORKERS)
-        .enable_time()
-        .enable_io()
-        .build()?;
-
-    let client = Arc::new(reqwest::Client::new());
-    let categories = get_categories(&client).await.unwrap();
-
-    let handlers = Arc::new(Mutex::new(Vec::new()));
-    let finish = Arc::new(Mutex::new(false));
-    let i = 0;
-    for (category, uris) in categories {
-        let finish_clone = Arc::clone(&finish);
-        for (sub_category, uri) in uris {
-            *finish_clone.lock().await = false;
-            let category_clone = category.clone();
-            let sub_category_clone = sub_category.clone();
-            let uri_clone = uri.clone();
-            let finish_clone_clone = Arc::clone(&finish_clone);
-
-            let handler = cpu_pool.spawn(async move {
-                let client = Client::new();
-                let res = client
-                    .get(format!("{}{}", self::BASE_URI, uri_clone.clone()))
-                    .send()
-                    .await
-                    .unwrap()
-                    .text()
-                    .await
-                    .unwrap();
-
-                if is_last_page(res, i).await {
-                    *finish_clone_clone.lock().await = true;
-                    return None;
-                }
-
-                if let Ok(batches) = get_product_batches(
-                    client.clone(),
-                    category_clone,
-                    sub_category_clone,
-                    uri_clone,
-                    i,
-                )
-                .await
-                {
-                    return Some(batches);
-                }
-
-                None
-            });
-
-            handlers.lock().await.push(handler);
-        }
-    }
-
-    let result = Arc::new(Mutex::new(Vec::new()));
-
-    for product_pages in handlers.lock().await.drain(..) {
-        let result_clone = Arc::clone(&result);
-        if let Some(mut page_result) = product_pages.await? {
-            let result_clone_clone = Arc::clone(&result_clone);
-            for page in page_result.drain(..) {
-                let result_clone_clone_clone = Arc::clone(&result_clone_clone);
-                cpu_pool.spawn(async move {
-                    let mut lock = result_clone_clone_clone.lock().await;
-                    lock.push(page);
-                });
-            }
-        }
-    }
-
-    cpu_pool.shutdown_background();
-    Ok(result)*/
-}
-
-async fn add_product_pages(
-    product_page_list: Arc<Mutex<Vec<ProductPage>>>,
-) -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>> {
-    let cpu_pool = runtime::Builder::new_multi_thread()
-        .worker_threads(WORKERS)
-        .enable_time()
-        .enable_io()
-        .build()?;
-
-    let mut handlers = Vec::new();
-
-    for product_page in product_page_list.lock().await.iter() {
-        let mutex_page = Arc::new(Mutex::new(product_page.clone()));
-
-        let handler: JoinHandle<(String, Box<String>)> = cpu_pool.spawn({
-            let mutex_page_clone = Arc::clone(&mutex_page);
-
-            async move {
-                let lock = mutex_page_clone.lock().await;
-                let client = reqwest::Client::new();
-                let res = client
-                    .get(&lock.url)
-                    .send()
-                    .await
-                    .unwrap()
-                    .text()
-                    .await
-                    .unwrap();
-
-                (String::from(&lock.url), Box::from(res))
-            }
-        });
-
-        handlers.push(handler);
-    }
-
-    for handler in handlers {
-        let (url, html) = handler.await?;
-        for product_page in product_page_list.lock().await.iter_mut() {
-            if product_page.url == url {
-                product_page.html = html.clone();
-            }
-        }
-    }
-
-    cpu_pool.shutdown_background();
-
-    Ok(product_page_list)
+    return Ok(Arc::new(Mutex::new(pages.take())));
 }
 
 async fn insert_product_pages(product_pages: Arc<Mutex<Vec<ProductPage>>>) -> anyhow::Result<()> {
-    let pages = &*product_pages.lock().await.clone();
-
-    let stream = stream::iter(pages.to_vec().into_iter());
-    let db_pool = Arc::new(get_database_pool().await?);
-
-    Ok(stream
-        .for_each_concurrent(WORKERS, |page| {
-            let db_pool_clone = Arc::clone(&db_pool);
-            async move {
-                sqlx::query(
-                    "INSERT INTO pages (url, html, parsed, raw_data) VALUES (?1, ?2, ?3, ?4)",
-                )
-                .bind(&page.url)
-                .bind(&*page.html)
-                .bind(0)
-                .bind("".to_string())
-                .execute(&*db_pool_clone)
-                .await
-                .unwrap();
-            }
-        })
-        .await)
+    todo!();
+    // let pages = &*product_pages.lock().await.clone();
+    //
+    // let stream = stream::iter(pages.to_vec().into_iter());
+    // let db_pool = Arc::new(get_database_pool().await?);
+    //
+    // Ok(stream
+    //     .for_each_concurrent(WORKERS, |page| {
+    //         let db_pool_clone = Arc::clone(&db_pool);
+    //         async move {
+    //             sqlx::query(
+    //                 "INSERT INTO pages (url, html, parsed, raw_data) VALUES (?1, ?2, ?3, ?4)",
+    //             )
+    //             .bind(&page.url)
+    //             .bind(&*page.html)
+    //             .bind(0)
+    //             .bind("".to_string())
+    //             .execute(&*db_pool_clone)
+    //             .await
+    //             .unwrap();
+    //         }
+    //     })
+    //     .await)
 }
 
 #[paw::main]
@@ -371,8 +294,9 @@ async fn main(args: Args) -> anyhow::Result<()> {
 
 async fn scrape() -> anyhow::Result<()> {
     let product_page_list = get_product_page_list().await?;
-    let product_pages = add_product_pages(product_page_list).await?;
-    insert_product_pages(product_pages).await?;
+    dbg!(product_page_list);
+    // let product_pages = add_product_pages(product_page_list).await?;
+    // insert_product_pages(product_pages).await?;
 
     Ok(())
 }

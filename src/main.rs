@@ -7,17 +7,15 @@ use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
-use std::process::exit;
 use std::rc::Rc;
 use std::sync::Arc;
 use structopt::StructOpt;
 use tokio::fs::File;
-use tokio::runtime;
 use tokio::sync::Mutex;
 
 const BASE_URI: &str = "https://www.webscraper.io";
 const DB_NAME: &str = "webscraper.db";
-const WORKERS: usize = 2;
+const WORKERS: usize = 4;
 
 #[derive(StructOpt, Debug)]
 struct Args {
@@ -70,6 +68,7 @@ struct ProductPage {
     product_urls: Vec<String>,
     last_page: Option<u16>,
     index: u16,
+    iter_index: u16,
 }
 
 impl ProductPage {
@@ -81,6 +80,7 @@ impl ProductPage {
             product_urls: Vec::new(),
             last_page: None,
             index: 1,
+            iter_index: 1,
         }
     }
 
@@ -114,7 +114,7 @@ impl ProductPage {
             .collect::<Vec<String>>()
     }
 
-    async fn parse_current_page(&mut self) -> anyhow::Result<bool> {
+    async fn parse_next_page(&mut self) -> anyhow::Result<bool> {
         if self.index > self.last_page.unwrap_or(1) {
             return Ok(false);
         }
@@ -130,8 +130,22 @@ impl ProductPage {
         self.last_page = self.get_last_page(&res);
         self.product_urls.extend(self.get_product_urls(&res));
         self.index += 1;
+        self.iter_index += 1;
 
         Ok(true)
+    }
+}
+
+impl Iterator for ProductPage {
+    type Item = u16;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter_index += 1;
+        if self.last_page.is_none() || self.iter_index > self.last_page.unwrap() {
+            self.iter_index = self.index;
+            return None;
+        }
+        Some(self.iter_index)
     }
 }
 
@@ -200,7 +214,7 @@ async fn get_categories(
     return Ok(result);
 }
 
-async fn get_product_page_list() -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>> {
+async fn get_product_page_list() -> anyhow::Result<Vec<ProductPage>> {
     let client = Arc::new(reqwest::Client::new());
     let categories = get_categories(&client).await.unwrap();
 
@@ -216,7 +230,7 @@ async fn get_product_page_list() -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>>
                 stream::iter(uris.into_iter())
                     .for_each(|(sub_category, uri)| {
                         let ref_page_clone_clone = Rc::clone(&ref_page_clone);
-                        let ref_category_clone = ref_category.clone();
+                        let ref_category_clone = Rc::clone(&ref_category);
 
                         async move {
                             let mut product_page = ProductPage::new(
@@ -226,7 +240,7 @@ async fn get_product_page_list() -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>>
                             );
 
                             product_page
-                                .parse_current_page()
+                                .parse_next_page()
                                 .await
                                 .expect("Failed to parse product page");
 
@@ -238,17 +252,27 @@ async fn get_product_page_list() -> anyhow::Result<Arc<Mutex<Vec<ProductPage>>>>
         })
         .await;
 
-    // pages.take().iter_mut().for_each(|page| {
-    //     let count = (page.last_page.unwrap_or(1) - page.index) + 1;
-    //     stream::iter((0..=count).into_iter().map(|_| tokio::spawn(
-    //
-    //         future::ready(())
-    //     )))
-    //         .for_each_concurrent(WORKERS, |f| async move { f.await })
-    //         .await;
-    // });
+    let mut product_pages = pages.take();
+    for page in product_pages.iter_mut() {
+        let atomic_page = Arc::new(Mutex::new(page));
+        let indexes = atomic_page.lock().await.into_iter().collect::<Vec<_>>();
 
-    return Ok(Arc::new(Mutex::new(pages.take())));
+        stream::iter(indexes.into_iter())
+            .for_each_concurrent(WORKERS, |_| {
+                let atomic_page_clone = Arc::clone(&atomic_page);
+                async move {
+                    atomic_page_clone
+                        .lock()
+                        .await
+                        .parse_next_page()
+                        .await
+                        .expect("Failed to parse product page");
+                }
+            })
+            .await;
+    }
+
+    Ok(product_pages)
 }
 
 async fn insert_product_pages(product_pages: Arc<Mutex<Vec<ProductPage>>>) -> anyhow::Result<()> {

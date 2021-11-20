@@ -53,8 +53,8 @@ CREATE TABLE IF NOT EXISTS pages (
 );
         "#,
     )
-    .execute(&db_pool)
-    .await?;
+        .execute(&db_pool)
+        .await?;
 
     db_pool.close().await;
     Ok(())
@@ -69,6 +69,7 @@ struct ProductPage {
     last_page: Option<u16>,
     index: u16,
     iter_index: u16,
+    process: u8,
 }
 
 impl ProductPage {
@@ -81,6 +82,7 @@ impl ProductPage {
             last_page: None,
             index: 1,
             iter_index: 1,
+            process: 1,
         }
     }
 
@@ -115,10 +117,6 @@ impl ProductPage {
     }
 
     async fn parse_next_page(&mut self) -> anyhow::Result<bool> {
-        if self.index > self.last_page.unwrap_or(1) {
-            return Ok(false);
-        }
-
         let client = Client::new();
         let res = client
             .get(&self.get_index_url())
@@ -131,6 +129,12 @@ impl ProductPage {
         self.product_urls.extend(self.get_product_urls(&res));
         self.index += 1;
         self.iter_index += 1;
+
+        if self.last_page.is_some()
+            && (self.index > self.last_page.unwrap())
+        {
+            self.process = 0
+        }
 
         Ok(true)
     }
@@ -255,7 +259,8 @@ async fn get_product_page_list() -> anyhow::Result<Vec<ProductPage>> {
     let mut product_pages = pages.take();
     for page in product_pages.iter_mut() {
         let atomic_page = Arc::new(Mutex::new(page));
-        let indexes = atomic_page.lock().await.into_iter().collect::<Vec<_>>();
+        let mut indexes = atomic_page.lock().await.into_iter().collect::<Vec<_>>();
+        indexes.push(0);
 
         stream::iter(indexes.into_iter())
             .for_each_concurrent(WORKERS, |_| {
@@ -275,8 +280,7 @@ async fn get_product_page_list() -> anyhow::Result<Vec<ProductPage>> {
     Ok(product_pages)
 }
 
-async fn insert_product_pages(product_pages: Arc<Mutex<Vec<ProductPage>>>) -> anyhow::Result<()> {
-    todo!();
+async fn insert_product_pages(product_pages: Vec<ProductPage>) -> anyhow::Result<()> {
     // let pages = &*product_pages.lock().await.clone();
     //
     // let stream = stream::iter(pages.to_vec().into_iter());
@@ -299,6 +303,7 @@ async fn insert_product_pages(product_pages: Arc<Mutex<Vec<ProductPage>>>) -> an
     //         }
     //     })
     //     .await)
+    Ok(())
 }
 
 #[paw::main]
@@ -319,7 +324,6 @@ async fn main(args: Args) -> anyhow::Result<()> {
 async fn scrape() -> anyhow::Result<()> {
     let product_page_list = get_product_page_list().await?;
     dbg!(product_page_list);
-    // let product_pages = add_product_pages(product_page_list).await?;
     // insert_product_pages(product_pages).await?;
 
     Ok(())

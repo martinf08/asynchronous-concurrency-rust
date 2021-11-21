@@ -1,4 +1,5 @@
 use futures::*;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use regex::Regex;
 use reqwest::Client;
 use select::document::Document;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use structopt::StructOpt;
 use tokio::fs::File;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 const BASE_URI: &str = "https://www.webscraper.io";
 const DB_NAME: &str = "webscraper.db";
@@ -34,6 +36,7 @@ pub async fn get_database_pool() -> Result<SqlitePool, anyhow::Error> {
 }
 
 async fn init() -> anyhow::Result<()> {
+    println!("Remove old webscraper.db sqlite database file");
     let filename = format!("./{}", DB_NAME);
     match tokio::fs::remove_file(&filename).await {
         _ => (),
@@ -65,6 +68,8 @@ CREATE TABLE IF NOT EXISTS products (
     .await?;
 
     db_pool.close().await;
+
+    println!("Database was successfully initialized");
     Ok(())
 }
 
@@ -411,6 +416,12 @@ async fn get_product_page_list() -> anyhow::Result<Vec<ProductPage>> {
     let client = Arc::new(reqwest::Client::new());
     let categories = get_categories(&client).await.unwrap();
 
+    let multi_progress_bar = Arc::new(MultiProgress::new());
+    let style =
+        ProgressStyle::default_bar().template("{prefix} {bar:40.green/yellow} {pos:>7}/{len:7}");
+
+    println!("Parsing category pages");
+
     let pages = Rc::new(RefCell::new(Vec::new()));
     stream::iter(categories.into_iter())
         .for_each(|(category, uris)| {
@@ -446,13 +457,22 @@ async fn get_product_page_list() -> anyhow::Result<Vec<ProductPage>> {
         .await;
 
     let mut product_pages = pages.take();
+
     for page in product_pages.iter_mut() {
         let atomic_page = Arc::new(Mutex::new(page));
         let mut indexes = atomic_page.lock().await.into_iter().collect::<Vec<_>>();
         indexes.push(0);
 
+        let progress_bar = multi_progress_bar.add(ProgressBar::new(indexes.len() as u64));
+        progress_bar.set_style(style.clone());
+        progress_bar.tick();
+        progress_bar.set_prefix(format!("{}", &atomic_page.lock().await.sub_category));
+
         stream::iter(indexes.into_iter())
-            .for_each_concurrent(WORKERS, |_| {
+            .for_each_concurrent(WORKERS, |i| {
+                progress_bar.inc(1);
+                progress_bar.set_message(format!("item #{}", i + 1));
+
                 let atomic_page_clone = Arc::clone(&atomic_page);
                 async move {
                     atomic_page_clone
@@ -464,6 +484,8 @@ async fn get_product_page_list() -> anyhow::Result<Vec<ProductPage>> {
                 }
             })
             .await;
+
+        progress_bar.finish();
     }
 
     Ok(product_pages)
@@ -472,9 +494,24 @@ async fn get_product_page_list() -> anyhow::Result<Vec<ProductPage>> {
 async fn parse_pages(product_pages: Vec<ProductPage>) -> anyhow::Result<()> {
     let db_pool = Arc::new(get_database_pool().await?);
 
+    let nb_uri = product_pages
+        .iter()
+        .map(|p| p.products_uri.len())
+        .sum::<usize>();
+    let progress_bar = Arc::new(ProgressBar::new(nb_uri as u64));
+    let style =
+        ProgressStyle::default_bar().template("{prefix} {bar:40.green/yellow} {pos:>7}/{len:7}");
+
+    progress_bar.set_style(style);
+    progress_bar.set_prefix("Parsing products");
+    progress_bar.tick();
+
     for product_page in product_pages.iter() {
+        let progress_bar_clone = Arc::clone(&progress_bar);
+
         stream::iter(&product_page.products_uri)
             .for_each_concurrent(WORKERS, |uri| {
+                let progress_bar_clone_clone = Arc::clone(&progress_bar_clone);
                 let db_pool_clone = Arc::clone(&db_pool);
                 async move {
                     let product =
@@ -482,6 +519,7 @@ async fn parse_pages(product_pages: Vec<ProductPage>) -> anyhow::Result<()> {
                             .await
                             .expect("Failed to get product");
 
+                    progress_bar_clone_clone.inc(1);
                     let variants = Product::generate_variants(product);
 
                     stream::iter(variants.into_iter())
@@ -529,6 +567,8 @@ async fn get_product(
 #[paw::main]
 #[tokio::main]
 async fn main(args: Args) -> anyhow::Result<()> {
+    let now = Instant::now();
+
     match args.cmd {
         x if x == "init" => init().await?,
         x if x == "scrape" => scrape().await?,
@@ -538,12 +578,14 @@ async fn main(args: Args) -> anyhow::Result<()> {
         }
     }
 
+    println!("Finish in {:.2} secs", now.elapsed().as_secs_f64());
     Ok(())
 }
 
 async fn scrape() -> anyhow::Result<()> {
     let product_page_list = get_product_page_list().await?;
     parse_pages(product_page_list).await?;
+    println!("Product saved in webscraper.db sqlite file");
 
     Ok(())
 }

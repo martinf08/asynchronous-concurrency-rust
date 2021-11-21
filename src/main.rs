@@ -2,11 +2,9 @@ use futures::*;
 use regex::Regex;
 use reqwest::Client;
 use select::document::Document;
-use select::node::Data;
 use select::predicate::*;
 use serde_derive::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use sqlx::Error::Database;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
@@ -53,6 +51,7 @@ CREATE TABLE IF NOT EXISTS products (
   category VARCHAR(255) NOT NULL,
   sub_category VARCHAR(255) NOT NULL,
   name VARCHAR(255) NOT NULL,
+  origin VARCHAR(255) NOT NULL,
   cost INTEGER NOT NULL,
   description TEXT,
   color VARCHAR(255),
@@ -160,12 +159,13 @@ impl Iterator for ProductPage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Product {
     uid: String,
     category: String,
     sub_category: String,
     name: String,
+    origin: String,
     cost: f32,
     description: String,
     colors: Vec<String>,
@@ -181,6 +181,7 @@ impl Default for Product {
             category: String::new(),
             sub_category: String::new(),
             name: String::new(),
+            origin: String::new(),
             cost: 0.0,
             description: String::new(),
             colors: Vec::new(),
@@ -267,8 +268,77 @@ impl Product {
             )
             .count() as u32;
 
-        dbg!(&self);
         Ok(())
+    }
+
+    fn generate_variants(product: Self) -> Vec<Self> {
+        let mut variants = Vec::new();
+
+        match (product.colors.len(), product.sizes.len()) {
+            (0, 0) => {
+                panic!("No colors or sizes found for product : {}", &product.origin);
+            }
+            (0, _) => {
+                for size in product.sizes.iter() {
+                    let mut variant = product.clone();
+                    variant.sizes = vec![size.clone()];
+                    variants.push(variant);
+                }
+            }
+            (_, 0) => {
+                for color in product.colors.iter() {
+                    let mut variant = product.clone();
+                    variant.colors = vec![color.clone()];
+                    variants.push(variant);
+                }
+            }
+            (_, _) => {
+                for color in product.colors.iter() {
+                    for size in product.sizes.iter() {
+                        let mut variant = product.clone();
+                        variant.colors = vec![color.clone()];
+                        variant.sizes = vec![size.clone()];
+                        variants.push(variant);
+                    }
+                }
+            }
+        }
+
+        variants
+    }
+
+    fn build_uid(&self) -> String {
+        let source_id = self.origin.split("/").last().unwrap_or_default();
+
+        format!(
+            "{}-{}-{}",
+            source_id,
+            self.colors.join("-"),
+            self.sizes.join("-")
+        )
+    }
+
+    async fn insert(self, pool: Arc<SqlitePool>) {
+        sqlx::query(
+            r#"
+INSERT INTO products (uid, category, sub_category, name, origin, cost, description, color, size, review_count, review_stars)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+"#,
+    )
+            .bind(self.uid)
+            .bind(self.category)
+            .bind(self.sub_category)
+            .bind(self.name)
+            .bind(self.origin)
+            .bind(self.cost)
+            .bind(self.description)
+            .bind(self.colors.join(" "))
+            .bind(self.sizes.join(" "))
+            .bind(self.review_count)
+            .bind(self.review_stars)
+            .execute(&*pool)
+            .await
+            .unwrap();
     }
 }
 
@@ -404,10 +474,25 @@ async fn parse_pages(product_pages: Vec<ProductPage>) -> anyhow::Result<()> {
 
     for product_page in product_pages.iter() {
         stream::iter(&product_page.products_uri)
-            .for_each_concurrent(WORKERS, |uri| async move {
-                let product = get_product(uri, &product_page.category, &product_page.sub_category)
-                    .await
-                    .expect("Failed to get product");
+            .for_each_concurrent(WORKERS, |uri| {
+                let db_pool_clone = Arc::clone(&db_pool);
+                async move {
+                    let product =
+                        get_product(uri, &product_page.category, &product_page.sub_category)
+                            .await
+                            .expect("Failed to get product");
+
+                    let variants = Product::generate_variants(product);
+
+                    stream::iter(variants.into_iter())
+                        .for_each_concurrent(WORKERS, |variant| {
+                            let db_pool_clone_clone = Arc::clone(&db_pool_clone);
+                            async move {
+                                variant.insert(db_pool_clone_clone).await;
+                            }
+                        })
+                        .await;
+                }
             })
             .await;
     }
@@ -433,36 +518,12 @@ async fn get_product(
 
     product.category = category.to_string();
     product.sub_category = sub_category.to_string();
+    product.origin = uri.to_string();
 
     product.parse_html(&res)?;
+    product.build_uid();
 
     Ok(product)
-}
-
-async fn insert_product_pages(product_pages: Vec<ProductPage>) -> anyhow::Result<()> {
-    // let pages = &*product_pages.lock().await.clone();
-    //
-    // let stream = stream::iter(pages.to_vec().into_iter());
-    // let db_pool = Arc::new(get_database_pool().await?);
-    //
-    // Ok(stream
-    //     .for_each_concurrent(WORKERS, |page| {
-    //         let db_pool_clone = Arc::clone(&db_pool);
-    //         async move {
-    //             sqlx::query(
-    //                 "INSERT INTO pages (url, html, parsed, raw_data) VALUES (?1, ?2, ?3, ?4)",
-    //             )
-    //             .bind(&page.url)
-    //             .bind(&*page.html)
-    //             .bind(0)
-    //             .bind("".to_string())
-    //             .execute(&*db_pool_clone)
-    //             .await
-    //             .unwrap();
-    //         }
-    //     })
-    //     .await)
-    Ok(())
 }
 
 #[paw::main]

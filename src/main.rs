@@ -1,9 +1,11 @@
 use futures::*;
 use reqwest::Client;
 use select::document::Document;
+use select::node::Data;
 use select::predicate::*;
 use serde_derive::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::Error::Database;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
@@ -165,8 +167,8 @@ struct Product {
     name: String,
     cost: f32,
     description: String,
-    color: Option<Vec<String>>,
-    size: Option<Vec<String>>,
+    colors: Vec<String>,
+    sizes: Vec<String>,
     review_count: u32,
     review_stars: u32,
 }
@@ -180,8 +182,8 @@ impl Default for Product {
             name: String::new(),
             cost: 0.0,
             description: String::new(),
-            color: None,
-            size: None,
+            colors: Vec::new(),
+            sizes: Vec::new(),
             review_count: 0,
             review_stars: 0,
         }
@@ -191,23 +193,62 @@ impl Default for Product {
 impl Product {
     fn parse_html(&mut self, res: &String) -> anyhow::Result<()> {
         let doc = Document::from(res.as_str());
-        let frame = doc
-            .find(And(Name("div"), Class("row")).descendant(Class("thumbnail")))
-            .into_selection();
 
-        let name = frame
-            .find(
-                And(Name("div"), Class("caption"))
-                    .descendant(And(Name("h4"), Not(Attr("class", ())))),
-            )
-            .first()
+        let caption = Document::from(
+            doc.find(And(Name("div"), Class("caption")))
+                .next()
+                .ok_or(anyhow::anyhow!("Div caption not found"))?
+                .html()
+                .as_str(),
+        );
+
+        self.name = caption
+            .find(And(Name("h4"), Not(Attr("class", ()))))
+            .next()
             .map(|n| n.text())
             .unwrap_or_default();
 
-        self.name = name;
+        self.cost = caption
+            .find(And(Name("h4"), Class("price")))
+            .next()
+            .map(|n| n.text())
+            .unwrap_or_default()
+            .replace("$", "")
+            .parse::<f32>()
+            .unwrap_or_default();
+
+        self.description = caption
+            .find(And(Name("p"), Class("description")))
+            .next()
+            .map(|n| n.text())
+            .unwrap_or_default();
+
+        let frame = Document::from(
+            doc.find(And(Name("div"), Class("row")).descendant(Class("thumbnail")))
+                .next()
+                .ok_or(anyhow::anyhow!("Div thumbnail not found"))?
+                .html()
+                .as_str(),
+        );
+
+        self.colors = frame
+            .find(And(Name("select"), Attr("aria-label", "color")).descendant(Name("option")))
+            .filter_map(|n| n.attr("value"))
+            .map(|v| v.to_string())
+            .filter(|v| !v.is_empty())
+            .collect::<Vec<String>>();
+
+        self.sizes = frame
+            .find(
+                And(Name("div"), Class("swatches"))
+                    .descendant(And(Name("button"), Not(Attr("disabled", ())))),
+            )
+            .filter_map(|n| n.attr("value"))
+            .map(|v| v.to_string())
+            .filter(|v| !v.is_empty())
+            .collect::<Vec<String>>();
 
         dbg!(&self);
-
         Ok(())
     }
 }

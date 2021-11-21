@@ -312,15 +312,23 @@ impl Product {
         variants
     }
 
-    fn build_uid(&self) -> String {
+    fn build_uid(&mut self) {
         let source_id = self.origin.split("/").last().unwrap_or_default();
 
-        format!(
-            "{}-{}-{}",
-            source_id,
-            self.colors.join("-"),
-            self.sizes.join("-")
-        )
+        match (self.colors.len(), self.sizes.len()) {
+            (0, 0) => {
+                panic!("No colors or sizes found for product : {}", &self.origin);
+            }
+            (0, _) => {
+                self.uid = format!("{}-{}", source_id, self.sizes[0]);
+            }
+            (_, 0) => {
+                self.uid = format!("{}-{}", source_id, self.colors[0]);
+            }
+            (_, _) => {
+                self.uid = format!("{}-{}-{}", source_id, self.colors[0], self.sizes[0]);
+            }
+        }
     }
 
     async fn insert(self, pool: Arc<SqlitePool>) {
@@ -523,9 +531,10 @@ async fn parse_pages(product_pages: Vec<ProductPage>) -> anyhow::Result<()> {
                     let variants = Product::generate_variants(product);
 
                     stream::iter(variants.into_iter())
-                        .for_each_concurrent(WORKERS, |variant| {
+                        .for_each_concurrent(WORKERS, |mut variant| {
                             let db_pool_clone_clone = Arc::clone(&db_pool_clone);
                             async move {
+                                variant.build_uid();
                                 variant.insert(db_pool_clone_clone).await;
                             }
                         })
@@ -559,7 +568,6 @@ async fn get_product(
     product.origin = uri.to_string();
 
     product.parse_html(&res)?;
-    product.build_uid();
 
     Ok(product)
 }

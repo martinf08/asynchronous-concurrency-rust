@@ -44,17 +44,23 @@ async fn init() -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
-CREATE TABLE IF NOT EXISTS pages (
+CREATE TABLE IF NOT EXISTS products (
   id INTEGER PRIMARY KEY NOT NULL,
-  url TEXT NOT NULL,
-  html TEXT NOT NULL,
-  parsed INTEGER NOT NULL,
-  raw_data TEXT NOT NULL
+  uid VARCHAR(255) NOT NULL,
+  category VARCHAR(255) NOT NULL,
+  sub_category VARCHAR(255) NOT NULL,
+  name VARCHAR(255) NOT NULL,
+  cost INTEGER NOT NULL,
+  description TEXT,
+  color VARCHAR(255),
+  size VARCHAR(255),
+  review_count INTEGER,
+  review_stars INTEGER
 );
         "#,
     )
-        .execute(&db_pool)
-        .await?;
+    .execute(&db_pool)
+    .await?;
 
     db_pool.close().await;
     Ok(())
@@ -65,7 +71,7 @@ struct ProductPage {
     category: String,
     sub_category: String,
     uri: String,
-    product_urls: Vec<String>,
+    products_uri: Vec<String>,
     last_page: Option<u16>,
     index: u16,
     iter_index: u16,
@@ -78,7 +84,7 @@ impl ProductPage {
             category: category.to_string(),
             sub_category,
             uri,
-            product_urls: Vec::new(),
+            products_uri: Vec::new(),
             last_page: None,
             index: 1,
             iter_index: 1,
@@ -126,13 +132,11 @@ impl ProductPage {
             .await?;
 
         self.last_page = self.get_last_page(&res);
-        self.product_urls.extend(self.get_product_urls(&res));
+        self.products_uri.extend(self.get_product_urls(&res));
         self.index += 1;
         self.iter_index += 1;
 
-        if self.last_page.is_some()
-            && (self.index > self.last_page.unwrap())
-        {
+        if self.last_page.is_some() && (self.index > self.last_page.unwrap()) {
             self.process = 0
         }
 
@@ -150,6 +154,61 @@ impl Iterator for ProductPage {
             return None;
         }
         Some(self.iter_index)
+    }
+}
+
+#[derive(Debug)]
+struct Product {
+    uid: String,
+    category: String,
+    sub_category: String,
+    name: String,
+    cost: f32,
+    description: String,
+    color: Option<Vec<String>>,
+    size: Option<Vec<String>>,
+    review_count: u32,
+    review_stars: u32,
+}
+
+impl Default for Product {
+    fn default() -> Self {
+        Product {
+            uid: String::new(),
+            category: String::new(),
+            sub_category: String::new(),
+            name: String::new(),
+            cost: 0.0,
+            description: String::new(),
+            color: None,
+            size: None,
+            review_count: 0,
+            review_stars: 0,
+        }
+    }
+}
+
+impl Product {
+    fn parse_html(&mut self, res: &String) -> anyhow::Result<()> {
+        let doc = Document::from(res.as_str());
+        let frame = doc
+            .find(And(Name("div"), Class("row")).descendant(Class("thumbnail")))
+            .into_selection();
+
+        let name = frame
+            .find(
+                And(Name("div"), Class("caption"))
+                    .descendant(And(Name("h4"), Not(Attr("class", ())))),
+            )
+            .first()
+            .map(|n| n.text())
+            .unwrap_or_default();
+
+        self.name = name;
+
+        dbg!(&self);
+
+        Ok(())
     }
 }
 
@@ -280,6 +339,46 @@ async fn get_product_page_list() -> anyhow::Result<Vec<ProductPage>> {
     Ok(product_pages)
 }
 
+async fn parse_pages(product_pages: Vec<ProductPage>) -> anyhow::Result<()> {
+    let db_pool = Arc::new(get_database_pool().await?);
+
+    for product_page in product_pages.iter() {
+        stream::iter(&product_page.products_uri)
+            .for_each_concurrent(WORKERS, |uri| async move {
+                let product = get_product(uri, &product_page.category, &product_page.sub_category)
+                    .await
+                    .expect("Failed to get product");
+            })
+            .await;
+    }
+
+    Ok(())
+}
+
+async fn get_product(
+    uri: &String,
+    category: &String,
+    sub_category: &String,
+) -> anyhow::Result<Product> {
+    let client = Client::new();
+
+    let res = client
+        .get(format!("{}{}", self::BASE_URI, uri))
+        .send()
+        .await?
+        .text()
+        .await?;
+
+    let mut product = Product::default();
+
+    product.category = category.to_string();
+    product.sub_category = sub_category.to_string();
+
+    product.parse_html(&res)?;
+
+    Ok(product)
+}
+
 async fn insert_product_pages(product_pages: Vec<ProductPage>) -> anyhow::Result<()> {
     // let pages = &*product_pages.lock().await.clone();
     //
@@ -323,8 +422,7 @@ async fn main(args: Args) -> anyhow::Result<()> {
 
 async fn scrape() -> anyhow::Result<()> {
     let product_page_list = get_product_page_list().await?;
-    dbg!(product_page_list);
-    // insert_product_pages(product_pages).await?;
+    parse_pages(product_page_list).await?;
 
     Ok(())
 }

@@ -1,4 +1,5 @@
 use futures::*;
+use regex::Regex;
 use reqwest::Client;
 use select::document::Document;
 use select::node::Data;
@@ -247,6 +248,24 @@ impl Product {
             .map(|v| v.to_string())
             .filter(|v| !v.is_empty())
             .collect::<Vec<String>>();
+
+        let review_count_raw = frame
+            .find(And(Name("div"), Class("ratings")).descendant(Name("p")))
+            .map(|n| n.text())
+            .collect::<String>();
+
+        let re = Regex::new(r"\d+")?;
+
+        if let Some(caps) = re.captures(&review_count_raw) {
+            self.review_count = caps[0].parse::<u32>().unwrap_or_default();
+        }
+
+        self.review_stars = frame
+            .find(
+                And(Name("div"), Class("ratings"))
+                    .descendant(And(Name("span"), Class("glyphicon-star"))),
+            )
+            .count() as u32;
 
         dbg!(&self);
         Ok(())

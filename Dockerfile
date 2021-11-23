@@ -12,5 +12,3 @@ COPY . .
 RUN RUSTFLAGS=-Ctarget-feature=-crt-static cargo build --release
 
 CMD ["/bin/ash", "-c", "sleep infinity"]
-
-

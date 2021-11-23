@@ -11,8 +11,6 @@ COPY . .
 
 RUN RUSTFLAGS=-Ctarget-feature=-crt-static cargo build --release
 
-#/app/target/release/asynchronous-concurrency-rust
-
 CMD ["/bin/ash", "-c", "sleep infinity"]
 
 

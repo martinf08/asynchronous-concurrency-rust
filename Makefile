@@ -8,4 +8,14 @@ build: ## Build the project
 
 DIR := ${CURDIR}
 run: ## Launch the program
-	docker run -it scraper /bin/ash -c "target/release/asynchronous-concurrency-rust init && target/release/asynchronous-concurrency-rust"
+	@echo "Launch the container"
+	@docker run -it --rm \
+	-v $(CURDIR)/data:/app/data \
+	--name scraper scraper \
+	/bin/ash -c "target/release/asynchronous-concurrency-rust init && \
+	target/release/asynchronous-concurrency-rust && \
+	cp /app/webscraper.db /app/data/"
+	@echo "Changing the owner and the rights of the directory data"
+	@sudo chown -R $(id -u ${USER}):$(id -g ${USER}) ./data
+	@sudo chmod -R 777 ./data
+	@echo "File webscraper.db is in the data directory"

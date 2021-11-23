@@ -1,6 +1,7 @@
 # asynchronous-concurrency-rust
 ![version](https://img.shields.io/badge/cargo-1.56.0-blue)
 ![version](https://img.shields.io/badge/rustc-1.56.0-blue)
+![Latest Stable Version](https://github.com/martinf08/asynchronous-concurrency-rust/workflows/build/badge.svg)
 
 It is an example of using the `async-concurrency` with rust
 

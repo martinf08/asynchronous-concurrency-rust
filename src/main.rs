@@ -565,7 +565,7 @@ async fn get_product(
 
     product.category = category.to_string();
     product.sub_category = sub_category.to_string();
-    product.origin = uri.to_string();
+    product.origin = format!("{}{}", self::BASE_URI, uri.to_string());
 
     product.parse_html(&res)?;
 
